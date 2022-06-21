@@ -68,6 +68,8 @@ MQTTClient g_mqtt_client;
 MQTTPacket_connectData g_mqtt_packet_connect_data = MQTTPacket_connectData_initializer;
 MQTTMessage g_mqtt_message;
 void message_arrived(MessageData *msg_data);
+#define MQTT_TIMEOUT  (60) /* seconds */
+volatile uint8_t mqtt_connect_timeout = 0;
 
 // Timer
 #define DEFAULT_TIMEOUT  (1000) /* 1 second */
@@ -92,6 +94,8 @@ const int bell_p_pin = 2; // Bell voltage inverter pin 1
 const int bell_n_pin = 3; // Bell voltage inverter pin 2
 volatile int bell_50hz = BELL_HV_HALF_PERIOD;
 volatile int bell_timer = 0; // Bell off.
+// LED
+const int led_pin = 6;
 
 typedef struct
 {
@@ -114,14 +118,23 @@ void message_arrived(MessageData *msg_data)
   MQTTMessage *message = msg_data->message;
   if (strncmp("{'bell':'1'}",(char*)message->payload,(uint32_t)message->payloadlen)==0)
   {
+    // Ring bell.
     bell_on();
   }
   else if (strncmp("{'mp3_file':'",(char*)message->payload,12)==0)
   {
+    // Play MP3 file.
     mp3.play(((char*)message->payload)[13]-'0');
+  }
+  else if (strncmp("{'ping':'1'}",(char*)message->payload,(uint32_t)message->payloadlen)==0)
+  {
+    // Reset ping timeout.
+    mqtt_connect_timeout = MQTT_TIMEOUT;
+    digitalWrite(led_pin,LOW); // LED off: connected.
   }
   else
   {
+    // Unexpected/unhandled topic.
     Serial.printf("%.*s\n",(uint32_t)message->payloadlen,(uint8_t *)message->payload);
   }
 }
@@ -135,6 +148,10 @@ void repeating_timer_callback(void)
   {
     MDNS_time_handler(); // 1 second
     //Serial.println('*');
+    if (mqtt_connect_timeout>0)
+    {
+      mqtt_connect_timeout -= 1;
+    }
   }
 
   if (bell_timer>0)
@@ -160,6 +177,14 @@ void repeating_timer_callback(void)
 time_t my_millis(void)
 {
   return g_msec_cnt;
+}
+
+void my_sleep(uint32_t ms)
+{
+  uint32_t t_sleep_start = my_millis();
+  while (my_millis()<t_sleep_start+ms)
+  {
+  }
 }
 
 uint32_t dial_idle_timer = 0;
@@ -340,30 +365,13 @@ void mp3_init(void)
   }
 }
 
-void setup(void)
+bool mqtt_connect(void)
 {
   int32_t retval = 0;
 
-  Serial.begin(115200);
-  //while (!Serial); // debug only.
+  Serial.printf("MQTT connect\r\n");
+  digitalWrite(led_pin,HIGH); // LED on: not connected.
 
-  // Initialize bell inverter pins.
-  pinMode(bell_p_pin,OUTPUT);
-  pinMode(bell_n_pin,OUTPUT);
-
-  memset(alphadial_str,0,sizeof(alphadial_str));
-  alphadial_index = 0;
-
-  wizchip_spi_initialize();
-  wizchip_cris_initialize();
-  wizchip_reset();
-  wizchip_initialize();
-  wizchip_check();
-  wizchip_1ms_timer_initialize(repeating_timer_callback);
-  
-  network_initialize(g_net_info);
-  print_network_information(g_net_info);
-  
   // Try to discover IP of MQTT broker using mDNS.
   Serial.printf("Doing mDNS to find MQTT broker '%s'\r\n",MQTT_SERVER_NAME);
   MDNS_init(MQTT_SOCKET+1,mdns_buffer);
@@ -376,7 +384,7 @@ void setup(void)
   else
   {
     Serial.println("mDNS failed, cannot connect to MQTT broker.");
-    while (1);
+    return false;
   }
   
   Serial.printf("MQTT network connect ");
@@ -385,7 +393,7 @@ void setup(void)
   if (retval!=1)
   {
     Serial.printf("failed\n");
-    while (1);
+    return false;
   }
   Serial.printf("OK\n");
   
@@ -406,7 +414,7 @@ void setup(void)
   if (retval<0)
   {
     Serial.printf("failed: %d\n", retval);
-    while (1);
+    return false;
   }
   Serial.printf("OK\n");
    
@@ -416,10 +424,45 @@ void setup(void)
   if (retval<0)
   {
     Serial.printf("failed : %d\n", retval);
-    while (1);
+    return false;
   }
   Serial.printf("OK\n");
 
+  Serial.printf("MQTT connect OK\r\n");
+  mqtt_connect_timeout = MQTT_TIMEOUT;
+
+  digitalWrite(led_pin,LOW); // LED off: connected.
+  return true;
+}
+
+void setup(void)
+{
+  Serial.begin(115200);
+  //while (!Serial); // debug only.
+
+  // Initialize bell inverter pins.
+  pinMode(bell_p_pin,OUTPUT);
+  pinMode(bell_n_pin,OUTPUT);
+
+  // Initialize LED pin.
+  pinMode(led_pin,OUTPUT);
+  digitalWrite(led_pin,HIGH); // LED on: not connected.
+  
+  memset(alphadial_str,0,sizeof(alphadial_str));
+  alphadial_index = 0;
+
+  wizchip_spi_initialize();
+  wizchip_cris_initialize();
+  wizchip_reset();
+  wizchip_initialize();
+  wizchip_check();
+  wizchip_1ms_timer_initialize(repeating_timer_callback);
+  
+  network_initialize(g_net_info);
+  print_network_information(g_net_info);
+  
+  mqtt_connect();
+  
   mp3_init(); // Don't call too early, MP3 module needs time to boot.
   
   Serial.println("Setup completed.");
@@ -441,12 +484,20 @@ void loop(void)
   static char number_str[PHONE_NUMBER_LENGTH+1];
   int32_t retval = 0;
 
+  if (mqtt_connect_timeout==0)
+  {
+    while (mqtt_connect()==false)
+    {
+      my_sleep(30000); // Sleep 30 seconds.
+    }
+  }
+
   retval = MQTTYield(&g_mqtt_client,g_mqtt_packet_connect_data.keepAliveInterval);
-	if (retval<0)
-	{
-		Serial.printf(" Yield error : %d\n", retval);
-		while (1);
-	}
+  if (retval<0)
+  {
+    Serial.printf(" Yield error : %d\n", retval);
+    //while (1);
+  }
 
   uint32_t t_now = my_millis();
   if (t_now>t_previous+PHONE_POLL_PERIOD)
